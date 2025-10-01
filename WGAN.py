@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# File              : test_wgan.py
+# File              : wgan_gp.py
 # Author            : none <none>
 # Date              : 14.04.2022
 # Last Modified Date: 15.04.2022
-# Last Modified By  : none <none>
-""" 基于MNIST 实现Wasserstein GAN (WGAN) """
+""" 基于MNIST 实现Wasserstein GAN with Gradient Penalty (WGAN-GP) """
 
 import torch
 import torchvision
@@ -20,16 +19,16 @@ latent_dim = 100  # 生成器输入噪声向量的维度
 label_emb_dim = 10
 batch_size = 64  # 训练批量大小
 use_gpu = torch.cuda.is_available()  # 检查是否可用GPU
-save_dir = "wgan_generated_images"
+save_dir = "wgan_gp_generated_images"
 os.makedirs(save_dir, exist_ok=True)
 
 # 创建目录用于保存损失图像
-loss_plot_dir = "wgan_loss_plots"
+loss_plot_dir = "wgan_gp_loss_plots"
 os.makedirs(loss_plot_dir, exist_ok=True)
 
-# WGAN关键参数
+# WGAN-GP关键参数
 n_critic = 5  # 判别器训练次数:生成器训练次数的比例
-clip_value = 0.01  # 权重裁剪值
+lambda_gp = 10  # 梯度惩罚系数
 
 
 class Generator(nn.Module):
@@ -129,6 +128,39 @@ class Discriminator(nn.Module):
         return score
 
 
+def compute_gradient_penalty(discriminator, real_images, fake_images, labels):
+    """计算梯度惩罚 - WGAN-GP的核心改进"""
+    batch_size = real_images.size(0)
+
+    # 随机插值系数
+    alpha = torch.rand(batch_size, 1, 1, 1)
+    if use_gpu:
+        alpha = alpha.cuda()
+
+    # 创建插值样本
+    interpolates = (alpha * real_images + (1 - alpha) * fake_images).requires_grad_(True)
+    d_interpolates = discriminator(interpolates, labels)
+
+    # 创建与d_interpolates相同形状的全1张量
+    fake = torch.ones(d_interpolates.size(), requires_grad=False)
+    if use_gpu:
+        fake = fake.cuda()
+
+    # 计算梯度
+    gradients = torch.autograd.grad(
+        outputs=d_interpolates,
+        inputs=interpolates,
+        grad_outputs=fake,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+
+    gradients = gradients.view(gradients.size(0), -1)
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    return gradient_penalty
+
+
 # 数据准备
 # 加载MNIST数据集，使用标准化将图像范围调整到[-1,1]以匹配Tanh输出
 dataset = torchvision.datasets.MNIST("mnist_data", train=True, download=True,
@@ -147,13 +179,13 @@ dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle
 generator = Generator()
 discriminator = Discriminator()
 
-# 定义优化器 - WGAN使用RMSprop而不是Adam
-g_optimizer = torch.optim.RMSprop(generator.parameters(), lr=0.0003)
-d_optimizer = torch.optim.RMSprop(discriminator.parameters(), lr=0.0003)
+# 定义优化器 - WGAN-GP使用Adam优化器
+g_optimizer = torch.optim.Adam(generator.parameters(), lr=0.0001, betas=(0.5, 0.9))
+d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=0.0001, betas=(0.5, 0.9))
 
 # 如果可用，将模型和数据移动到GPU
 if use_gpu:
-    print("use gpu for training")
+    print("使用GPU进行训练")
     generator = generator.cuda()
     discriminator = discriminator.cuda()
 
@@ -161,17 +193,14 @@ if use_gpu:
 g_losses = []
 d_losses = []
 wasserstein_distances = []  # WGAN特有的Wasserstein距离度量
+real_scores_list = []
+fake_scores_list = []
+gradient_penalties = []
 steps = []
-
-
-# 权重裁剪函数
-def clip_weights(model, clip_value):
-    for param in model.parameters():
-        param.data.clamp_(-clip_value, clip_value)
-
 
 # 训练循环
 num_epoch = 200  # 训练轮数
+
 for epoch in range(num_epoch):
     for i, mini_batch in enumerate(dataloader):
         gt_images, labels = mini_batch  # 获取真实图像和标签
@@ -191,24 +220,24 @@ for epoch in range(num_epoch):
             # 清零判别器梯度
             d_optimizer.zero_grad()
 
-            # 计算真实图像的分数
-            real_scores = discriminator(gt_images, labels)
-
             # 生成假图像
             fake_images = generator(z, labels)
+
+            # 计算真实图像的分数
+            real_scores = discriminator(gt_images, labels)
 
             # 计算假图像的分数
             fake_scores = discriminator(fake_images.detach(), labels)
 
-            # WGAN判别器损失：最大化真实图像分数与假图像分数的差距
-            d_loss = -torch.mean(real_scores) + torch.mean(fake_scores)
+            # 计算梯度惩罚
+            gradient_penalty = compute_gradient_penalty(discriminator, gt_images.data, fake_images.data, labels)
+
+            # WGAN-GP判别器损失
+            d_loss = -torch.mean(real_scores) + torch.mean(fake_scores) + lambda_gp * gradient_penalty
 
             # 反向传播和优化
             d_loss.backward()
             d_optimizer.step()
-
-            # 裁剪判别器权重以满足Lipschitz约束
-            clip_weights(discriminator, clip_value)
 
         # 训练生成器
         # 生成随机噪声
@@ -241,65 +270,93 @@ for epoch in range(num_epoch):
         g_losses.append(g_loss.item())
         d_losses.append(d_loss.item())
         wasserstein_distances.append(wasserstein_distance.item())
+        real_scores_list.append(torch.mean(real_scores).item())
+        fake_scores_list.append(torch.mean(fake_scores).item())
+        gradient_penalties.append(gradient_penalty.item())
 
         # 定期输出训练状态
         if i % 50 == 0:
             print(
-                f"step:{len(dataloader) * epoch + i}, g_loss:{g_loss.item():.4f}, d_loss:{d_loss.item():.4f}, wasserstein_dist:{wasserstein_distance.item():.4f}")
+                f"Epoch: {epoch}, Step: {i}, G Loss: {g_loss.item():.4f}, D Loss: {d_loss.item():.4f}, "
+                f"Wasserstein Dist: {wasserstein_distance.item():.4f}, GP: {gradient_penalty.item():.4f}"
+            )
 
         # 定期保存生成的图像样本
         if i % 400 == 0:
             # 将图像从[-1,1]范围转换回[0,1]范围以便保存
-            image = (fake_images[:16].data + 1) / 2
-            torchvision.utils.save_image(image, os.path.join(save_dir, f"image_{len(dataloader) * epoch + i}.png"),
-                                         nrow=4)
+            with torch.no_grad():
+                image = (fake_images[:16].data + 1) / 2
+                torchvision.utils.save_image(image, os.path.join(save_dir, f"image_{len(dataloader) * epoch + i}.png"),
+                                             nrow=4)
+
+    print(f"Epoch {epoch} 完成")
 
 # 训练结束后绘制最终损失图像
-print("Training completed! Generating final loss plots...")
-plt.figure(figsize=(15, 10))
+print("训练完成！生成最终损失图像...")
+plt.figure(figsize=(20, 15))
 
 # 绘制生成器和判别器损失
-plt.subplot(2, 2, 1)
-plt.plot(steps, g_losses, label='Generator Loss', color='blue')
-plt.plot(steps, d_losses, label='Discriminator Loss', color='red')
+plt.subplot(3, 2, 1)
+plt.plot(steps, g_losses, label='Generator Loss', color='blue', alpha=0.7)
+plt.plot(steps, d_losses, label='Discriminator Loss', color='red', alpha=0.7)
 plt.xlabel('Training Steps')
 plt.ylabel('Loss')
-plt.title('WGAN Generator and Discriminator Loss')
+plt.title('WGAN-GP Generator and Discriminator Loss')
 plt.legend()
 plt.grid(True)
 
 # 绘制Wasserstein距离
-plt.subplot(2, 2, 2)
-plt.plot(steps, wasserstein_distances, label='Wasserstein Distance', color='green')
+plt.subplot(3, 2, 2)
+plt.plot(steps, wasserstein_distances, label='Wasserstein Distance', color='green', alpha=0.7)
 plt.xlabel('Training Steps')
 plt.ylabel('Distance')
 plt.title('Wasserstein Distance')
 plt.legend()
 plt.grid(True)
 
-# 绘制损失比率
-plt.subplot(2, 2, 3)
-ratio = [g / d if d != 0 else 0 for g, d in zip(g_losses, d_losses)]
-plt.plot(steps, ratio, label='G/D Loss Ratio', color='brown')
+# 绘制真实和假图像分数
+plt.subplot(3, 2, 3)
+plt.plot(steps, real_scores_list, label='Real Scores', color='orange', alpha=0.7)
+plt.plot(steps, fake_scores_list, label='Fake Scores', color='purple', alpha=0.7)
 plt.xlabel('Training Steps')
-plt.ylabel('Ratio')
-plt.title('Generator/Discriminator Loss Ratio')
+plt.ylabel('Score')
+plt.title('Real and Fake Scores')
+plt.legend()
+plt.grid(True)
+
+# 绘制梯度惩罚
+plt.subplot(3, 2, 4)
+plt.plot(steps, gradient_penalties, label='Gradient Penalty', color='red', alpha=0.7)
+plt.xlabel('Training Steps')
+plt.ylabel('Penalty')
+plt.title('Gradient Penalty')
 plt.legend()
 plt.grid(True)
 
 # 绘制移动平均损失
-plt.subplot(2, 2, 4)
+plt.subplot(3, 2, 5)
 window = 50
 g_smooth = np.convolve(g_losses, np.ones(window) / window, mode='valid')
 d_smooth = np.convolve(d_losses, np.ones(window) / window, mode='valid')
 w_smooth = np.convolve(wasserstein_distances, np.ones(window) / window, mode='valid')
 steps_smooth = steps[window - 1:]
-plt.plot(steps_smooth, g_smooth, label='Generator Loss (MA)', color='blue')
-plt.plot(steps_smooth, d_smooth, label='Discriminator Loss (MA)', color='red')
-plt.plot(steps_smooth, w_smooth, label='Wasserstein Dist (MA)', color='green')
+plt.plot(steps_smooth, g_smooth, label='Generator Loss (MA)', color='blue', linewidth=2)
+plt.plot(steps_smooth, d_smooth, label='Discriminator Loss (MA)', color='red', linewidth=2)
+plt.plot(steps_smooth, w_smooth, label='Wasserstein Dist (MA)', color='green', linewidth=2)
 plt.xlabel('Training Steps')
 plt.ylabel('Loss/Distance (Moving Average)')
 plt.title('Smoothed Metrics (Window = {})'.format(window))
+plt.legend()
+plt.grid(True)
+
+# 绘制分数差异
+plt.subplot(3, 2, 6)
+score_diff = [real - fake for real, fake in zip(real_scores_list, fake_scores_list)]
+score_diff_smooth = np.convolve(score_diff, np.ones(window) / window, mode='valid')
+plt.plot(steps_smooth, score_diff_smooth, label='Score Difference (MA)', color='magenta', linewidth=2)
+plt.xlabel('Training Steps')
+plt.ylabel('Score Difference')
+plt.title('Real-Fake Score Difference (Moving Average)')
 plt.legend()
 plt.grid(True)
 
@@ -307,11 +364,11 @@ plt.tight_layout()
 plt.savefig(os.path.join(loss_plot_dir, 'final_loss_plot.png'), dpi=200, bbox_inches='tight')
 plt.close()
 
-print(f"Final loss plots saved to {loss_plot_dir}/")
+print(f"最终损失图像已保存到 {loss_plot_dir}/")
 
 # 生成特定数字的示例图像
-print("Generating example images for each digit...")
-example_dir = "wgan_example_images"
+print("为每个数字生成示例图像...")
+example_dir = "wgan_gp_example_images"
 os.makedirs(example_dir, exist_ok=True)
 
 with torch.no_grad():
@@ -329,4 +386,13 @@ with torch.no_grad():
         generated_images = (generated_images + 1) / 2
         torchvision.utils.save_image(generated_images, os.path.join(example_dir, f"digit_{digit}.png"), nrow=4)
 
-print(f"Example images saved to {example_dir}/")
+print(f"示例图像已保存到 {example_dir}/")
+
+# 保存模型
+model_dir = "wgan_gp_models"
+os.makedirs(model_dir, exist_ok=True)
+torch.save(generator.state_dict(), os.path.join(model_dir, "generator_final.pth"))
+torch.save(discriminator.state_dict(), os.path.join(model_dir, "discriminator_final.pth"))
+print(f"模型已保存到 {model_dir}/")
+
+print("WGAN-GP训练完成！")
